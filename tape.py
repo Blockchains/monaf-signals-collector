@@ -82,7 +82,12 @@ def summ(xs):
 # ---- health ----
 hl = [h for h in rows('health', daysfor(h0, h1)) if h.get('kind') == 'minute' and h0 * 1000 <= h['t'] < h1 * 1000]
 heads = [h for h in rows('heads', daysfor(h0, h1)) if h0 <= h['recv'] / 1000 < h1]
-gaps = [(heads[i]['recv'] - heads[i - 1]['recv']) for i in range(1, len(heads))]
+_end = min(h1, int(time.time())) * 1000
+_r = [h0 * 1000] + [h['recv'] for h in heads] + [_end]  # include window edges: silence at start/end of the hour is a gap too
+gaps = [(_r[i] - _r[i - 1]) for i in range(1, len(_r))] if _end > h0 * 1000 else []
+# box/VM suspends: collector logs kind=pause {t, ms} after the wall clock jumps; sum overlap with this window
+pauses = [(h['t'] - h['ms'], h['t']) for h in rows('health', daysfor(h0 - 86400, h1 + 86400)) if h.get('kind') == 'pause']
+paused_s = sum(max(0, min(b, h1 * 1000) - max(a, h0 * 1000)) for a, b in pauses) / 1000
 disc = [h for h in rows('health', daysfor(h0, h1)) if h.get('kind') == 'disconnect' and h0 * 1000 <= h['t'] < h1 * 1000]
 bfs = [h for h in rows('health', daysfor(h0, h1)) if h.get('kind') == 'backfill' and h0 * 1000 <= h['t'] < h1 * 1000]
 try: hb = json.load(open(f'{D}/heartbeat.json'))
@@ -170,7 +175,7 @@ def analysis_prose():
     else:
         lines.append("Fade research has zero resolved triggers so far — waiting for more imbalance samples.")
     lines.append(f"Collector heartbeat: connected={hb.get('connected')}, headAgeMs={hb.get('headAgeMs')}, "
-                 f"process up {fmt(up,2)} h, restarts in window {sum(1 for r in restarts if h0 <= r < h1)} "
+                 f"process up {fmt(up,2)} h (wall clock, includes suspends), box paused {fmt(paused_s/60,1)} min in window, restarts in window {sum(1 for r in restarts if h0 <= r < h1)} "
                  f"(total recorded {len(restarts)}). Minute heartbeats present {covered}/{round(span/60)}.")
     lines.append("Interpretation: this page is a research tape of observed Monad pool flow against Binance closes. "
                  "It does not execute, size, or recommend trades. Past hit rates do not predict future results.")
@@ -190,6 +195,7 @@ sections = [
         ['Current: connected / head age (ms)', f"{hb.get('connected')} / {fmt(hb.get('headAgeMs'))}"]])),
     ('Collector uptime', table(['Metric', 'Value'], [
         ['Minutes with a heartbeat in window', f"{covered} of {round(span/60)}"],
+        ['Box/VM paused in window (min)', fmt(paused_s / 60, 1)],
         ['Collector process up (h)', fmt(up, 2)],
         ['Restarts in window / total', f"{sum(1 for r in restarts if h0 <= r < h1)} / {len(restarts)}"],
         ['Data days collected', f"{data_days} day folder(s), {data_span_d:.2f} days of events (target ≥7)"]])),
