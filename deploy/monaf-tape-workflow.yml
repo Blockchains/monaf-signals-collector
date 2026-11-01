@@ -1,6 +1,5 @@
 # Lives in Blockchains/monaf-tape (.github/workflows/tape.yml). Builds the hourly tape page from the merged
-# box + Actions shards in the private collector repo (read via a read-only deploy key secret), unless the box
-# already published that hour. Public repo => free Actions minutes.
+# box + Actions shards in the public collector repo; never replaces a page built from more data. Public repo => free Actions minutes.
 name: tape
 on:
   schedule:
@@ -23,18 +22,18 @@ jobs:
         run: |
           H0=$(( $(date +%s) / 3600 * 3600 - 3600 )); H=$(date -u -d @$H0 +%Y-%m-%d/%H00-UTC.html)
           echo "h=$H" >> $GITHUB_OUTPUT; echo "h0=$H0" >> $GITHUB_OUTPUT
-          if [ -f "site/$H" ] && [ "${{ inputs.force }}" != true ]; then echo "skip=1" >> $GITHUB_OUTPUT; echo "page for $H exists"; else echo "skip=0" >> $GITHUB_OUTPUT; fi
+          echo "skip=0" >> $GITHUB_OUTPUT  # always build; tape.py keeps whichever page (box or Actions) has more data
       - uses: actions/checkout@v4
         if: steps.chk.outputs.skip == '0'
-        with: { repository: Blockchains/monaf-signals-collector, ssh-key: "${{ secrets.COLLECTOR_DEPLOY_KEY }}", path: col }
+        with: { repository: Blockchains/monaf-signals-collector, path: col }
       - uses: actions/checkout@v4
         if: steps.chk.outputs.skip == '0'
-        with: { repository: Blockchains/monaf-signals-collector, ssh-key: "${{ secrets.COLLECTOR_DEPLOY_KEY }}", ref: data, path: shards }
+        with: { repository: Blockchains/monaf-signals-collector, ref: data, path: shards }
       - name: Materialize + build tape
         if: steps.chk.outputs.skip == '0'
         run: |
           python3 col/scripts/materialize.py shards sig/data
-          SIGNALS_DATA=$PWD/sig/data SIGNALS_RESTARTS=/dev/null python3 col/tape.py site ${{ steps.chk.outputs.h0 }}
+          SIGNALS_DATA=$PWD/sig/data SIGNALS_RESTARTS=/dev/null TAPE_FORCE=${{ inputs.force == 'true' && '1' || '0' }} python3 col/tape.py site ${{ steps.chk.outputs.h0 }}
       - name: Gitleaks + push
         if: steps.chk.outputs.skip == '0'
         run: |

@@ -267,12 +267,22 @@ for i in range(n):
         part_rels.append(f"{day}/{hhmm}-UTC-p{i+1}.html")
 
 os.makedirs(os.path.join(site, day), exist_ok=True)
+# Quality guard: never replace an existing page built from more data (e.g. box page vs Actions page, or vice versa)
+import re as _re
+_q_new = len(heads) * 10 + nev if 'nev' in dir() else len(heads) * 10
+try: _m = _re.search(r'<!-- tape-quality (\d+) -->', open(os.path.join(site, part_rels[0])).read())
+except Exception: _m = None
+if _m and int(_m.group(1)) > _q_new and os.environ.get('TAPE_FORCE') != '1':
+    sys.stderr.write(f"existing page quality {_m.group(1)} > new {_q_new}; keeping existing\n")
+    for _p in sorted(glob.glob(os.path.join(site, day, f'{hhmm}-UTC*.html'))): print(os.path.relpath(_p, site))
+    sys.exit(0)
 # Remove stale continuation pages for this hour so a shorter rebuild does not leave orphans
 for stale in glob.glob(os.path.join(site, day, f'{hhmm}-UTC*.html')):
     os.remove(stale)
 
 for i, chunks in enumerate(packed):
     html_out = wrap(part_rels[i], i, n, '\n'.join(chunks), part_rels)
+    if i == 0: html_out += f'\n<!-- tape-quality {_q_new} -->\n'
     open(os.path.join(site, part_rels[i]), 'w').write(html_out)
 
 # Index: all hour parts + every other tape page, newest first
