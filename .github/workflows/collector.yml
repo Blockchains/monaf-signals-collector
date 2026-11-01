@@ -1,0 +1,68 @@
+# Off-box redundant Monad signals collector (public Monad RPC only - no secrets).
+# Pattern from mondex maker-keeper: ~5h50m runs that self-chain (dispatch next ~10 min before the end, so runs overlap
+# during handover only), plus a */10 cron watchdog that restarts the chain if it died.
+# COST GATE: the cron and the self-chain only act when repo variable ALWAYS_ON == 'true'. While the repo is PRIVATE on a
+# free account (2,000 min/month) leave it unset - always-on needs ~43k min/month. Manual dispatch always works.
+name: collector
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      run_for_s: { description: "collector run length (s)", default: "21000" }
+      chain: { description: "self-chain the next run (needs ALWAYS_ON=true)", default: "true" }
+permissions:
+  contents: write
+  actions: write
+jobs:
+  collect:
+    # job-level gate => a skipped scheduled job costs 0 minutes
+    if: github.event_name == 'workflow_dispatch' || vars.ALWAYS_ON == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SIGNALS_DIR: ${{ github.workspace }}/../sig
+      RUN_FOR_S: ${{ inputs.run_for_s || '21000' }}
+    steps:
+      - name: Guard (max 2 concurrent runs, only during handover)
+        id: guard
+        run: |
+          n=$(gh run list -R "$GITHUB_REPOSITORY" -w collector.yml -s in_progress --json databaseId -q "[.[]|select(.databaseId != $GITHUB_RUN_ID)]|length")
+          q=$(gh run list -R "$GITHUB_REPOSITORY" -w collector.yml -s queued --json databaseId -q "[.[]|select(.databaseId != $GITHUB_RUN_ID)]|length")
+          echo "other in_progress=$n queued=$q"
+          lim=1; [ "${{ github.event_name }}" = workflow_dispatch ] && lim=2
+          if [ "$n" -ge "$lim" ]; then echo "skip=1" >> $GITHUB_OUTPUT; echo "chain alive - nothing to do"; else echo "skip=0" >> $GITHUB_OUTPUT; fi
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.skip == '0'
+      - uses: actions/setup-node@v4
+        if: steps.guard.outputs.skip == '0'
+        with: { node-version: 22 }
+      - name: Build + tools
+        if: steps.guard.outputs.skip == '0'
+        run: |
+          npx -y esbuild@0.24.0 src/collector.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/c.mjs --log-level=warning
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar xz -C /usr/local/bin gitleaks
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+      - name: Collect + ship shards every 5 min (+ self-chain)
+        if: steps.guard.outputs.skip == '0'
+        run: |
+          mkdir -p "$SIGNALS_DIR"; SRC="gha-$GITHUB_RUN_ID"; W="$RUNNER_TEMP/ship"
+          node dist/c.mjs > "$RUNNER_TEMP/collector.log" 2>&1 &
+          CP=$!; start=$(date +%s); next=$((start + 300)); chained=0
+          chain_at=$((start + RUN_FOR_S - 600))
+          while kill -0 $CP 2>/dev/null; do
+            sleep 10; now=$(date +%s)
+            if [ $now -ge $next ]; then scripts/ship.sh "$SIGNALS_DIR/data" "$W" "$SRC" || true; next=$((now + 300)); tail -c 300 "$SIGNALS_DIR/data/heartbeat.json"; echo; fi
+            if [ $chained = 0 ] && [ $now -ge $chain_at ] && [ "${{ inputs.chain || 'true' }}" = true ] && [ "${{ vars.ALWAYS_ON }}" = true ]; then
+              gh workflow run collector.yml -R "$GITHUB_REPOSITORY" -f run_for_s="$RUN_FOR_S" -f chain=true && chained=1 && echo "dispatched next run"
+            fi
+          done
+          wait $CP || true
+          scripts/ship.sh "$SIGNALS_DIR/data" "$W" "$SRC" || true
+          grep -v -i "quiknode\|qn\.pro" "$RUNNER_TEMP/collector.log" | tail -40
+      - name: Self-chain fallback (run ended early / chain step missed)
+        if: always() && !cancelled() && steps.guard.outputs.skip == '0' && vars.ALWAYS_ON == 'true' && inputs.chain != 'false'
+        run: |
+          n=$(gh run list -R "$GITHUB_REPOSITORY" -w collector.yml -s in_progress --json databaseId -q "[.[]|select(.databaseId != $GITHUB_RUN_ID)]|length")
+          [ "$n" -ge 1 ] || gh workflow run collector.yml -R "$GITHUB_REPOSITORY" -f run_for_s="$RUN_FOR_S" -f chain=true

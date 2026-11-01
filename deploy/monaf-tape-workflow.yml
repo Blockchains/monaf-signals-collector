@@ -1,0 +1,45 @@
+# Lives in Blockchains/monaf-tape (.github/workflows/tape.yml). Builds the hourly tape page from the merged
+# box + Actions shards in the private collector repo (read via a read-only deploy key secret), unless the box
+# already published that hour. Public repo => free Actions minutes.
+name: tape
+on:
+  schedule:
+    - cron: "7,27,47 * * * *"
+  workflow_dispatch:
+    inputs:
+      force: { description: "rebuild even if the page exists", default: "false" }
+permissions:
+  contents: write
+concurrency: { group: tape, cancel-in-progress: false }
+jobs:
+  tape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: site }
+      - name: Already published by the box?
+        id: chk
+        run: |
+          H0=$(( $(date +%s) / 3600 * 3600 - 3600 )); H=$(date -u -d @$H0 +%Y-%m-%d/%H00-UTC.html)
+          echo "h=$H" >> $GITHUB_OUTPUT; echo "h0=$H0" >> $GITHUB_OUTPUT
+          if [ -f "site/$H" ] && [ "${{ inputs.force }}" != true ]; then echo "skip=1" >> $GITHUB_OUTPUT; echo "page for $H exists"; else echo "skip=0" >> $GITHUB_OUTPUT; fi
+      - uses: actions/checkout@v4
+        if: steps.chk.outputs.skip == '0'
+        with: { repository: Blockchains/monaf-signals-collector, ssh-key: "${{ secrets.COLLECTOR_DEPLOY_KEY }}", path: col }
+      - uses: actions/checkout@v4
+        if: steps.chk.outputs.skip == '0'
+        with: { repository: Blockchains/monaf-signals-collector, ssh-key: "${{ secrets.COLLECTOR_DEPLOY_KEY }}", ref: data, path: shards }
+      - name: Materialize + build tape
+        if: steps.chk.outputs.skip == '0'
+        run: |
+          python3 col/scripts/materialize.py shards sig/data
+          SIGNALS_DATA=$PWD/sig/data SIGNALS_RESTARTS=/dev/null python3 col/tape.py site ${{ steps.chk.outputs.h0 }}
+      - name: Gitleaks + push
+        if: steps.chk.outputs.skip == '0'
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar xz -C /usr/local/bin gitleaks
+          cd site; git config user.name "monaf tape (actions)"; git config user.email "tape@users.noreply.github.com"
+          git add -A; git commit -qm "tape ${{ steps.chk.outputs.h }} (actions)" || { echo nothing; exit 0; }
+          gitleaks detect --source . --redact --no-banner --log-opts="-1" || { echo "gitleaks hit - abort"; exit 1; }
+          for i in 1 2 3 4 5; do git push -q && exit 0; git pull -q --rebase; sleep $((i*3)); done; exit 1
